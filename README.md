@@ -1,7 +1,9 @@
 # volinterior-cuda
 
-VMD-compatible GPU acceleration for Gaussian-density interior-volume analysis
-of molecular-dynamics trajectories.
+[![Tests](https://github.com/Youchengw/volinterior-cuda/actions/workflows/ci.yml/badge.svg)](https://github.com/Youchengw/volinterior-cuda/actions/workflows/ci.yml)
+
+GPU-accelerated, VMD-compatible implementation of measure volinterior for
+molecular-dynamics trajectories, written in Python and CuPy.
 
 The package reimplements the `measure volinterior` workflow in Python and
 CuPy: VMD-style QuickSurf density, isovalue thresholding, deterministic VMD
@@ -11,8 +13,7 @@ trajectories.
 
 ## Current status
 
-This repository is being prepared from the validated AAV8 capsid workflow.
-The implementation has been checked against the VMD reference for 467
+The implementation has been checked against the VMD reference for 467 AAV8
 production frames with identical scalar voxel results. On the development RTX
 4060 Laptop benchmark, the optimized scalar path has a median time of about
 0.30 s/frame versus about 7.28 s/frame for the VMD production run. These are
@@ -29,6 +30,7 @@ are optional:
 
 ```bash
 python -m pip install -e ".[trajectory,cuda,dev]"
+volinterior-cuda --help
 ```
 
 The `cuda` extra uses the CuPy CUDA 12 package. Choose the CuPy package matching
@@ -74,6 +76,10 @@ The profiler reports trajectory extraction, grid construction, density,
 thresholding, ray generation, DDA, and reduction timings separately. Results
 and validation artifacts should be kept outside the source tree.
 
+The GitHub Actions workflow runs the CPU test suite on supported Python
+versions. CUDA execution should additionally be validated on the target NVIDIA
+GPU and CUDA runtime.
+
 ## Scientific and numerical scope
 
 The default configuration follows the VMD-compatible settings used in the
@@ -89,7 +95,7 @@ full box domain, which is a different scientific definition.
 ## Provenance and licensing
 
 The implementation is an independent Python/CuPy implementation of the
-VMD-compatible workflow and documents the VMD/CUDAMDFF provenance in the
-source and documentation. A final open-source license and any required VMD
-attribution must be confirmed before this repository is published.
+VMD-compatible workflow and documents the VMD/CUDAMDFF provenance in
+[NOTICE.md](NOTICE.md). Original code is released under the BSD 3-Clause
+License (LICENSE); VMD and CUDAMDFF remain separate projects.
 

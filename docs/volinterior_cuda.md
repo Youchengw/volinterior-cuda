@@ -41,7 +41,7 @@ a trusted reference when available. Synthetic sphere, shell, and disconnected
 components are useful topology tests. Sensitivity should cover resolution,
 isovalue, spacing, ray count, and atom-radius source.
 
-## Reference AAV8 result
+## Development reference benchmark (AAV8)
 
 The development AAV8 workflow used 467 production frames and found exact
 non-timing agreement with the VMD scalar results. On the local RTX 4060 Laptop,
@@ -50,8 +50,9 @@ while the VMD production reference had a median of approximately `7.283
 s/frame`. These numbers are a reproducibility reference for the development
 system, not a universal hardware guarantee.
 
-## Provenance
+## Provenance and licensing
 
 The implementation is independent Python/CuPy code that reproduces the VMD
-workflow semantics. VMD and CUDAMDFF remain separate projects; citations,
-source provenance, and any required attribution must be retained in releases.
+workflow semantics. VMD and CUDAMDFF remain separate projects; citations and
+source provenance are recorded in the repository NOTICE.md. The original code
+is released under the BSD 3-Clause License (LICENSE).

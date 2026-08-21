@@ -1,10 +1,17 @@
-# Provenance notice
+# Provenance and third-party attribution
 
-`volinterior-cuda` implements the VMD `measure volinterior` workflow and the
-VMD CUDAMDFF-compatible Gaussian-density behavior. VMD and its source code are
-separate projects. See the method documentation and source comments for the
-referenced algorithms and attribution requirements.
+`volinterior-cuda` is an independent Python/CuPy implementation of the VMD
+`measure volinterior` workflow. It does not redistribute VMD source code. The
+implementation is designed to reproduce the relevant VMD semantics, including
+VMD-style Poisson rays and the GPU Gaussian-density behavior documented by the
+VMD CUDAMDFF implementation.
 
-The final license and attribution text for this repository must be approved
-before public release.
+The original code in this repository is distributed under the BSD 3-Clause
+License in [LICENSE](LICENSE). VMD and CUDAMDFF are separate projects and are
+not relicensed by this repository.
+
+References:
+
+- [VMD](https://www.ks.uiuc.edu/Research/vmd/)
+- [VMD CUDAMDFF source documentation](https://www.ks.uiuc.edu/Research/vmd/doxygen/CUDAMDFF_8cu-source.html)
 
