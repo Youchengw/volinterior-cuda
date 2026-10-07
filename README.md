@@ -68,4 +68,26 @@ and checks. Connectivity and fuzzy preserve the density-defined shell; fixed
 DDA can reclassify material as exterior. These methods need not give identical
 volumes; fuzzy uses a blocked-ray fraction, not exact VMD probability-map parity.
 
+## Performance
+
+Measured on 2026-10-07: RTX 4060 Laptop GPU, Ryzen 7 7735H (16 CPU threads),
+Linux, CUDA 12.9 and CuPy 14.1.1. AAV8 protein: 492,780 atoms, approximately
+43 million voxels; resolution 12.5, spacing 1 Å, isovalue 0.5, 32 rays for DDA.
+
+| Method | Median (s/frame) | Observed range (s/frame) |
+|---|---:|---:|
+| CUDA connectivity | 0.116 | 0.115–0.119 |
+| CUDA fixed DDA | 0.323 | 0.307–0.325 |
+| CUDA fuzzy DDA (cutoff 0.9) | 2.564 | 2.517–2.585 |
+| VMD 2.0.1a1 fixed (GPU density + CPU DDA) | 7.235 | 6.683–7.301 |
+
+Each method had one warm-up, then three repetitions of frames 0, 400 and 800
+(9 measured calls). Coordinates, atom selection and radii matched across tools.
+Times cover density calculation and classification, excluding startup, input
+loading and file export. Python returns scalar counts; the native
+[VMD command](https://www.ks.uiuc.edu/Research/vmd/doxygen/TclMeasure_8C-source.html)
+also creates its volume/gradient map. This is an analysis-call comparison, not
+an isolated-kernel benchmark or full-trajectory throughput measurement.
+Connectivity, fixed and fuzzy use different classification definitions.
+
 BSD-3-Clause. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md).
