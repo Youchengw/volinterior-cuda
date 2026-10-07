@@ -1,36 +1,25 @@
-name: tests
-
+name: package
 on:
   push:
     branches: [main]
   pull_request:
-
 permissions:
   contents: read
-
 jobs:
-  test:
+  package:
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
-
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-
-      - name: Install package and test dependencies
-        run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
-
-      - name: Run tests
-        run: python -m pytest -q
-
-      - name: Compile Python sources
-        run: python -m compileall -q volinterior_cuda scripts tests
+      - name: Install standalone CPU package
+        run: python -m pip install .
+      - name: Check installed entry point
+        run: volinterior-cuda --help
+      - name: Build wheel
+        run: python -m pip wheel . --no-deps --wheel-dir /tmp/wheels

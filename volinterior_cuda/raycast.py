@@ -44,14 +44,19 @@ def _ray_escapes(surface: np.ndarray, index: tuple[int, int, int], direction: np
             return False
 
 
-def raycast_blocked_cpu(surface: np.ndarray, directions: np.ndarray) -> np.ndarray:
-    """Count blocked directions for every voxel (surface voxels are zero)."""
+def raycast_blocked_cpu(
+    surface: np.ndarray,
+    directions: np.ndarray,
+    *,
+    include_surface: bool = False,
+) -> np.ndarray:
+    """Count blocked directions, optionally starting rays from surface voxels."""
 
     surface = np.asarray(surface, dtype=bool)
     directions = np.asarray(directions, dtype=np.float32)
     blocked = np.zeros(surface.shape, dtype=np.uint16 if len(directions) <= 65535 else np.uint32)
     for index in np.ndindex(surface.shape):
-        if surface[index]:
+        if surface[index] and not include_surface:
             continue
         count = 0
         for direction in directions:
@@ -93,11 +98,13 @@ _RAY_KERNEL = r"""
 extern "C" __global__ void raycast_blocked(
     const unsigned char* surface_bits, const float* ray_delta,
     const signed char* ray_steps, int nrays,
-    int nx, int ny, int nz, unsigned short* blocked) {
+    int nx, int ny, int nz, int include_surface,
+    unsigned short* blocked) {
   int linear = blockDim.x * blockIdx.x + threadIdx.x;
   int nvox = nx * ny * nz;
   if (linear >= nvox) return;
-  if (surface_bits[linear >> 3] & (1u << (linear & 7))) {
+  if (!include_surface &&
+      (surface_bits[linear >> 3] & (1u << (linear & 7)))) {
     blocked[linear] = 0;
     return;
   }
@@ -155,12 +162,14 @@ _RAY_INTERIOR_KERNEL = r"""
 extern "C" __global__ void raycast_interior(
     const unsigned char* surface_bits, const float* ray_delta,
     const signed char* ray_steps, int nrays,
-    int nx, int ny, int nz, unsigned char* interior) {
+    int nx, int ny, int nz, int include_surface,
+    unsigned char* result) {
   int linear = blockDim.x * blockIdx.x + threadIdx.x;
   int nvox = nx * ny * nz;
   if (linear >= nvox) return;
-  if (surface_bits[linear >> 3] & (1u << (linear & 7))) {
-    interior[linear] = 0;
+  if (!include_surface &&
+      (surface_bits[linear >> 3] & (1u << (linear & 7)))) {
+    result[linear] = 0;
     return;
   }
 
@@ -202,11 +211,16 @@ extern "C" __global__ void raycast_interior(
       }
     }
   }
-  interior[linear] = all_blocked ? 1 : 0;
+  result[linear] = all_blocked ? 1 : 0;
 }
 """
 
-def raycast_blocked_cuda(surface, directions: np.ndarray):
+def raycast_blocked_cuda(
+    surface,
+    directions: np.ndarray,
+    *,
+    include_surface: bool = False,
+):
     """Return blocked-ray counts as a CuPy array."""
 
     try:
@@ -234,17 +248,24 @@ def raycast_blocked_cuda(surface, directions: np.ndarray):
         (blocks,),
         (threads,),
         (d_surface_bits, d_delta, d_steps, np.int32(len(directions)),
-         np.int32(nx), np.int32(ny), np.int32(nz), d_blocked),
+         np.int32(nx), np.int32(ny), np.int32(nz),
+         np.int32(bool(include_surface)), d_blocked),
     )
     return d_blocked
 
 
 
-def raycast_interior_cuda(surface, directions: np.ndarray):
-    """Return fixed-mode interior voxels with VMD DDA early exit.
+def raycast_interior_cuda(
+    surface,
+    directions: np.ndarray,
+    *,
+    include_surface: bool = False,
+):
+    """Return the all-rays-blocked predicate with VMD DDA early exit.
 
-    This is equivalent to ``blocked == nrays`` but does not compute a full
-    blocked-ray count for voxels that already escaped on one direction.
+    With include_surface false, surface voxels are zero, matching the legacy
+    interior-only API. Strict VMD 2.0.1a1 classification includes surface
+    voxels so exposed material can be relabeled exterior.
     """
 
     try:
@@ -278,6 +299,7 @@ def raycast_interior_cuda(surface, directions: np.ndarray):
             np.int32(nx),
             np.int32(ny),
             np.int32(nz),
+            np.int32(bool(include_surface)),
             d_interior,
         ),
     )
@@ -288,16 +310,24 @@ _RAY_INTERIOR_COUNT_KERNEL = r"""
 extern "C" __global__ void raycast_interior_count(
     const unsigned char* surface_bits, const float* ray_delta,
     const signed char* ray_steps, int nrays,
-    int nx, int ny, int nz, unsigned int* interior_count) {
-  __shared__ unsigned int block_count;
-  if (threadIdx.x == 0) block_count = 0;
+    int nx, int ny, int nz, int include_surface,
+    unsigned int* interior_count, unsigned int* selection_count) {
+  __shared__ unsigned int block_interior_count;
+  __shared__ unsigned int block_selection_count;
+  if (threadIdx.x == 0) {
+    block_interior_count = 0;
+    block_selection_count = 0;
+  }
   __syncthreads();
 
   int linear = blockDim.x * blockIdx.x + threadIdx.x;
   int nvox = nx * ny * nz;
+  bool is_surface = false;
   bool all_blocked = false;
-  if (linear < nvox &&
-      !(surface_bits[linear >> 3] & (1u << (linear & 7)))) {
+  if (linear < nvox) {
+    is_surface = surface_bits[linear >> 3] & (1u << (linear & 7));
+  }
+  if (linear < nvox && (!is_surface || include_surface)) {
     int ix = linear / (ny * nz);
     int rem = linear - ix * ny * nz;
     int iy = rem / nz;
@@ -338,10 +368,21 @@ extern "C" __global__ void raycast_interior_count(
     }
   }
 
-  if (all_blocked) atomicAdd(&block_count, 1u);
+  if (all_blocked) {
+    if (is_surface) {
+      atomicAdd(&block_selection_count, 1u);
+    } else {
+      atomicAdd(&block_interior_count, 1u);
+    }
+  }
   __syncthreads();
-  if (threadIdx.x == 0 && block_count > 0) {
-    atomicAdd(interior_count, block_count);
+  if (threadIdx.x == 0) {
+    if (block_interior_count > 0) {
+      atomicAdd(interior_count, block_interior_count);
+    }
+    if (block_selection_count > 0) {
+      atomicAdd(selection_count, block_selection_count);
+    }
   }
 }
 """
@@ -353,18 +394,25 @@ _RAY_INTERIOR_COUNT_3D_KERNEL = r"""
 extern "C" __global__ void raycast_interior_count_3d(
     const unsigned char* surface_bits, const float* ray_delta,
     const signed char* ray_steps, int nrays,
-    int nx, int ny, int nz, unsigned int* interior_count) {
-  __shared__ unsigned int block_count;
-  if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) block_count = 0;
+    int nx, int ny, int nz, int include_surface,
+    unsigned int* interior_count, unsigned int* selection_count) {
+  __shared__ unsigned int block_interior_count;
+  __shared__ unsigned int block_selection_count;
+  if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+    block_interior_count = 0;
+    block_selection_count = 0;
+  }
   __syncthreads();
 
   int ix = blockIdx.x * blockDim.x + threadIdx.x;
   int iy = blockIdx.y * blockDim.y + threadIdx.y;
   int iz = blockIdx.z * blockDim.z + threadIdx.z;
+  bool is_surface = false;
   bool all_blocked = false;
   if (ix < nx && iy < ny && iz < nz) {
     int linear = (ix * ny + iy) * nz + iz;
-    if (!(surface_bits[linear >> 3] & (1u << (linear & 7)))) {
+    is_surface = surface_bits[linear >> 3] & (1u << (linear & 7));
+    if (!is_surface || include_surface) {
       all_blocked = true;
 
       for (int ray = 0; ray < nrays && all_blocked; ++ray) {
@@ -406,17 +454,34 @@ extern "C" __global__ void raycast_interior_count_3d(
     }
   }
 
-  if (all_blocked) atomicAdd(&block_count, 1u);
+  if (all_blocked) {
+    if (is_surface) {
+      atomicAdd(&block_selection_count, 1u);
+    } else {
+      atomicAdd(&block_interior_count, 1u);
+    }
+  }
   __syncthreads();
-  if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0 && block_count > 0) {
-    atomicAdd(interior_count, block_count);
+  if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+    if (block_interior_count > 0) {
+      atomicAdd(interior_count, block_interior_count);
+    }
+    if (block_selection_count > 0) {
+      atomicAdd(selection_count, block_selection_count);
+    }
   }
 }
 """
 
 
-def raycast_interior_count_cuda(surface, directions: np.ndarray, *, layout: str = "3d") -> int:
-    """Return the fixed-mode interior voxel count without a mask allocation."""
+def raycast_partition_counts_cuda(
+    surface,
+    directions: np.ndarray,
+    *,
+    include_surface: bool = False,
+    layout: str = "3d",
+) -> tuple[int, int]:
+    """Return all-blocked free and surface counts without a mask allocation."""
 
     try:
         import cupy as cp
@@ -435,7 +500,8 @@ def raycast_interior_count_cuda(surface, directions: np.ndarray, *, layout: str 
         raise ValueError("grid is too large for a 32-bit interior counter")
 
     global _RAY_INTERIOR_COUNT_RAWKERNEL, _RAY_INTERIOR_COUNT_3D_RAWKERNEL
-    d_count = cp.zeros(1, dtype=cp.uint32)
+    d_interior_count = cp.zeros(1, dtype=cp.uint32)
+    d_selection_count = cp.zeros(1, dtype=cp.uint32)
     kernel_args = (
         d_surface_bits,
         d_delta,
@@ -444,7 +510,9 @@ def raycast_interior_count_cuda(surface, directions: np.ndarray, *, layout: str 
         np.int32(nx),
         np.int32(ny),
         np.int32(nz),
-        d_count,
+        np.int32(bool(include_surface)),
+        d_interior_count,
+        d_selection_count,
     )
     if layout == "1d":
         if _RAY_INTERIOR_COUNT_RAWKERNEL is None:
@@ -467,4 +535,21 @@ def raycast_interior_count_cuda(surface, directions: np.ndarray, *, layout: str 
         _RAY_INTERIOR_COUNT_3D_RAWKERNEL(blocks, block, kernel_args)
     else:
         raise ValueError("layout must be '1d' or '3d'")
-    return int(d_count.get()[0])
+    return int(d_interior_count.get()[0]), int(d_selection_count.get()[0])
+
+
+def raycast_interior_count_cuda(
+    surface,
+    directions: np.ndarray,
+    *,
+    layout: str = "3d",
+) -> int:
+    """Return the legacy free-voxel interior count without a mask allocation."""
+
+    interior, _ = raycast_partition_counts_cuda(
+        surface,
+        directions,
+        include_surface=False,
+        layout=layout,
+    )
+    return interior
