@@ -4,38 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "volinterior-cuda"
-version = "0.1.0"
-description = "VMD-compatible GPU-accelerated interior-volume analysis for molecular dynamics trajectories"
+version = "0.2.0"
+description = "Screened CUDA connectivity with user-selected fixed or fuzzy DDA fallback for capsid trajectories"
 license = {file = "LICENSE"}
-classifiers = [
-  "License :: OSI Approved :: BSD License",
-  "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3 :: Only",
-]
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = [
-  "numpy>=1.24",
-]
+dependencies = ["numpy>=1.24", "scipy>=1.10", "pandas>=2.0"]
 
 [project.optional-dependencies]
-trajectory = [
-  "MDAnalysis>=2.6",
-]
-cuda = [
-  "cupy-cuda12x>=13.0",
-]
-dev = [
-  "pytest>=8.0",
-]
+trajectory = ["MDAnalysis>=2.6"]
+cuda = ["cupy-cuda12x[ctk]>=14.1.1,<15"]
 
 [project.scripts]
 volinterior-cuda = "volinterior_cuda.cli:main"
 
 [tool.setuptools]
 packages = ["volinterior_cuda"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = "-ra"
-

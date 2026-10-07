@@ -1,24 +1,6 @@
-"""CUDA-capable Python implementation of the VMD ``volinterior`` workflow.
-
-The public entry point is :func:`measure_volinterior`.  CuPy is optional: the
-same code can be run with ``backend='cpu'`` for validation against a CUDA run.
-"""
-
+"""Screened connectivity with user-selected DDA fallback for capsid trajectories."""
 from .config import GridSpec, VolInteriorConfig
-from .measure import (
-    VolInteriorCountsResult,
-    VolInteriorResult,
-    measure_volinterior,
-    measure_volinterior_counts,
-)
-from .radii import infer_radii_from_names
+from .measure import FrameResult, measure_frame
 
-__all__ = [
-    "GridSpec",
-    "VolInteriorConfig",
-    "VolInteriorCountsResult",
-    "VolInteriorResult",
-    "infer_radii_from_names",
-    "measure_volinterior",
-    "measure_volinterior_counts",
-]
+__version__ = "0.2.0"
+__all__ = ["GridSpec", "VolInteriorConfig", "FrameResult", "measure_frame"]

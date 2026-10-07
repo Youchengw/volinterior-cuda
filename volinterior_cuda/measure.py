@@ -1,294 +1,138 @@
-"""Top-level orchestration for the CUDA/CPU volinterior implementation."""
-
-from __future__ import annotations
-
+"""QuickSurf followed by connectivity, VMD fixed DDA, or fuzzy DDA."""
 from dataclasses import dataclass
-from typing import Any
-
+from decimal import Decimal, ROUND_CEILING
+import time
 import numpy as np
-
-from .classify import fixed_connectivity_cpu, fixed_connectivity_cuda, surface_mask
+from .classify import connectivity_partition
 from .config import GridSpec, VolInteriorConfig
-from .density import cupy_available, quicksurf_density_cpu, quicksurf_density_cuda
+from .density import quicksurf_density_cpu, quicksurf_density_cuda
 from .directions import make_directions
 from .grid import make_grid
-from .raycast import (
-    raycast_blocked_cpu,
-    raycast_blocked_cuda,
-    raycast_interior_count_cuda,
-    raycast_interior_cuda,
-)
+from .raycast import raycast_blocked_cpu, raycast_blocked_cuda, raycast_interior_cuda, raycast_partition_counts_cuda
+
+DEFINITIONS = {"connectivity": "enclosed_free_6_material_preserving",
+               "fixed": "vmd_fixed_2_0_1a1_material_overwrite",
+               "fuzzy": "fuzzy_blocked_fraction_material_preserving"}
+
+
+def minimum_blocked(cutoff, nrays):
+    if cutoff is None or not np.isfinite(cutoff) or not 0 < cutoff <= 1:
+        raise ValueError("fuzzy requires an explicit finite cutoff in (0, 1]")
+    return int((Decimal(str(cutoff)) * nrays).to_integral_value(rounding=ROUND_CEILING))
 
 
 @dataclass
-class VolInteriorResult:
-    """Classification result returned on host memory for easy serialization."""
-
+class FrameResult:
+    counts: dict
     grid: GridSpec
-    surface: np.ndarray
-    interior: np.ndarray
-    exterior: np.ndarray
-    density: np.ndarray | None
-    probability: np.ndarray | None
-    blocked_rays: np.ndarray | None
-    backend: str
-    config: dict[str, object]
-    directions: np.ndarray | None
-
-    @property
-    def boundary(self) -> np.ndarray:
-        return self.surface
-
-    @property
-    def interior_voxels(self) -> int:
-        return int(np.count_nonzero(self.interior))
-
-    @property
-    def exterior_voxels(self) -> int:
-        return int(np.count_nonzero(self.exterior))
-
-    @property
-    def interior_volume_A3(self) -> float:
-        return self.interior_voxels * self.grid.voxel_volume_A3
-
-    def summary(self) -> dict[str, Any]:
-        return {
-            "backend": self.backend,
-            "grid": self.grid.as_dict(),
-            "interior_voxels": self.interior_voxels,
-            "exterior_voxels": self.exterior_voxels,
-            "surface_voxels": int(np.count_nonzero(self.surface)),
-            "interior_volume_A3": self.interior_volume_A3,
-            "config": self.config,
-        }
+    labels: np.ndarray | None = None
 
 
+def dda_partition(surface, directions, *, mode="fixed", cutoff=None, backend="cuda", return_labels=False):
+    """Fixed DDA reproduces VMD's escaping-material overwrite.
 
-@dataclass
-class VolInteriorCountsResult:
-    """Scalar fixed-mode result that keeps voxel masks on the GPU."""
-
-    grid: GridSpec
-    interior_voxels: int
-    surface_voxels: int
-    exterior_voxels: int
-    backend: str
-    config: dict[str, object]
-
-    @property
-    def total_voxels(self) -> int:
-        return self.grid.n_voxels
-
-    @property
-    def interior_volume_A3(self) -> float:
-        return self.interior_voxels * self.grid.voxel_volume_A3
-
-    def summary(self) -> dict[str, Any]:
-        return {
-            "backend": self.backend,
-            "grid": self.grid.as_dict(),
-            "total_voxels": self.total_voxels,
-            "interior_voxels": self.interior_voxels,
-            "surface_voxels": self.surface_voxels,
-            "exterior_voxels": self.exterior_voxels,
-            "interior_volume_A3": self.interior_volume_A3,
-            "config": self.config,
-        }
-
-def _resolve_backend(requested: str) -> str:
-    if requested == "cpu":
-        return "cpu"
-    if requested == "cuda":
-        if not cupy_available():
-            raise RuntimeError("backend='cuda' requested, but CuPy/CUDA is unavailable")
-        return "cuda"
-    if requested == "auto":
-        return "cuda" if cupy_available() else "cpu"
-    raise ValueError(f"unknown backend: {requested}")
-
-
-def measure_volinterior(
-    coords_A: np.ndarray,
-    radii_A: np.ndarray,
-    *,
-    box_A: np.ndarray | None = None,
-    config: VolInteriorConfig | None = None,
-    return_density: bool = False,
-    return_probability: bool = False,
-    grid_override: GridSpec | None = None,
-) -> VolInteriorResult:
-    """Measure interior volume for one coordinate frame.
-
-    For ``classifier='dda'`` the result follows the paper/VMD rule: a ray is
-    *blocked* when it hits an isosurface voxel and *unblocked* when it reaches
-    the grid boundary.  Fixed mode labels a voxel interior only when every ray
-    is blocked.  Fuzzy mode returns the blocked-ray probability and applies
-    ``fuzzy_cutoff`` to produce a binary interior mask.
-
-    ``classifier='connectivity'`` is an exact grid-topology alternative for
-    fixed mode and is faster for large grids; it does not depend on ``nrays``.
-    Fixed mode defaults to the all-rays-blocked mask without materializing the
-    full blocked-ray probability map. Set ``return_probability=True`` when the
-    per-voxel ray count is needed; fuzzy mode still computes it internally.
+    Fuzzy uses the explicit blocked-fraction criterion from the reanalysis;
+    material stays intact. This does not claim bitwise parity with every
+    version of VMD's probability-map discretizer.
     """
-
-    cfg = config or VolInteriorConfig()
-    backend = _resolve_backend(cfg.backend)
-    coords = np.asarray(coords_A, dtype=np.float32)
-    radii = np.asarray(radii_A, dtype=np.float32)
-    if radii.ndim != 1 or radii.shape[0] != coords.shape[0] or np.any(radii <= 0):
-        raise ValueError("radii_A must have one positive value per coordinate")
-    grid = (
-        grid_override
-        if grid_override is not None
-        else make_grid(coords, cfg, box_A=box_A, max_radius_A=float(np.max(radii)))
-    )
-
+    if mode not in {"fixed", "fuzzy"} or backend not in {"cpu", "cuda"}:
+        raise ValueError("invalid DDA mode or backend")
+    rays = np.asarray(directions, dtype=np.float32)
+    if rays.ndim != 2 or rays.shape[1] != 3 or not 1 <= len(rays) <= 65535:
+        raise ValueError("directions must have shape (1..65535, 3)")
+    if not np.isfinite(rays).all() or np.any(np.linalg.norm(rays, axis=1) == 0):
+        raise ValueError("ray directions must be finite and nonzero")
+    k = minimum_blocked(cutoff, len(rays)) if mode == "fuzzy" else len(rays)
     if backend == "cuda":
-        import cupy as cp
-
-        density_device = quicksurf_density_cuda(
-            coords,
-            radii,
-            grid,
-            cfg.radius_scale_A,
-            cfg.gausslim,
-            kernel_mode=cfg.density_kernel,
-            accel_grid_spacing_A=cfg.accel_grid_spacing_A,
-        )
-        surface_device = surface_mask(density_device, cfg.isovalue)
-        density = cp.asnumpy(density_device) if return_density else None
-        surface = cp.asnumpy(surface_device)
+        import cupy as xp
+        host = xp.asnumpy
     else:
-        density_host = quicksurf_density_cpu(
-            coords, radii, grid, cfg.radius_scale_A, cfg.gausslim
-        )
-        surface_host = surface_mask(density_host, cfg.isovalue)
-        density = density_host if return_density else None
-        surface = np.asarray(surface_host, dtype=bool)
-
-    directions: np.ndarray | None = None
-    blocked_host: np.ndarray | None = None
-    probability: np.ndarray | None = None
-
-    if cfg.mode == "fixed" and cfg.classifier == "connectivity":
-        if backend == "cuda":
-            interior_device, exterior_device = fixed_connectivity_cuda(surface_device)
-            interior = cp.asnumpy(interior_device)
-            exterior = cp.asnumpy(exterior_device)
-        else:
-            interior, exterior = fixed_connectivity_cpu(surface)
+        xp = np
+        host = np.asarray
+    material = xp.asarray(surface, dtype=bool)
+    if mode == "fixed" and backend == "cuda" and not return_labels:
+        interior, selection = raycast_partition_counts_cuda(material, rays, include_surface=True)
+        return {"interior_voxels": interior, "selection_voxels": selection,
+                "exterior_voxels": int(material.size) - interior - selection}, None
+    if mode == "fixed" and backend == "cuda":
+        inside = raycast_interior_cuda(material, rays, include_surface=True).astype(bool)
     else:
-        directions = make_directions(cfg.nrays, cfg.ray_scheme, cfg.ray_seed, cfg.ray_candidates)
-        free = ~surface
-        if backend == "cuda" and cfg.mode == "fixed" and not return_probability:
-            # The volume result only needs the all-rays-blocked predicate.
-            # This kernel exits as soon as one ray reaches the boundary.
-            interior_device = raycast_interior_cuda(surface_device, directions)
-            interior = free & cp.asnumpy(interior_device).astype(bool)
-            blocked_host = None
-            probability = None
-        else:
-            if backend == "cuda":
-                blocked_device = raycast_blocked_cuda(surface_device, directions)
-                blocked_host = cp.asnumpy(blocked_device)
-            else:
-                blocked_host = raycast_blocked_cpu(surface, directions)
-            probability = blocked_host.astype(np.float32) / float(cfg.nrays)
-            if cfg.mode == "fixed":
-                interior = free & (blocked_host == cfg.nrays)
-            else:
-                interior = free & (probability >= cfg.fuzzy_cutoff)
-        exterior = free & ~interior
-
-    return VolInteriorResult(
-        grid=grid,
-        surface=surface,
-        interior=np.asarray(interior, dtype=bool),
-        exterior=np.asarray(exterior, dtype=bool),
-        density=density,
-        probability=probability if return_probability else None,
-        blocked_rays=blocked_host,
-        backend=backend,
-        config=cfg.as_dict(),
-        directions=directions,
-    )
+        raycast = raycast_blocked_cuda if backend == "cuda" else raycast_blocked_cpu
+        blocked = raycast(material, rays, include_surface=mode == "fixed")
+        inside = blocked >= k
+    interior_mask = (~material) & inside
+    selection_mask = material & inside if mode == "fixed" else material
+    interior = int(xp.count_nonzero(interior_mask).item())
+    selection = int(xp.count_nonzero(selection_mask).item())
+    labels = host(xp.where(selection_mask, -5, xp.where(interior_mask, 0, 5)).astype(xp.int8)) if return_labels else None
+    return {"interior_voxels": interior, "selection_voxels": selection,
+            "exterior_voxels": int(material.size) - interior - selection}, labels
 
 
-
-def measure_volinterior_counts(
-    coords_A: np.ndarray,
-    radii_A: np.ndarray,
-    *,
-    box_A: np.ndarray | None = None,
-    config: VolInteriorConfig | None = None,
-) -> VolInteriorCountsResult:
-    """Measure fixed DDA volume while returning only scalar voxel counts.
-
-    The CUDA path leaves density/surface/interior masks on the device and
-    copies back only the three scalar counts. This is intended for trajectory
-    production runs that do not need diagnostic maps or ray probabilities.
-    """
-
-    cfg = config or VolInteriorConfig()
-    backend = _resolve_backend(cfg.backend)
-    if cfg.mode != "fixed" or cfg.classifier != "dda":
-        raise ValueError("measure_volinterior_counts requires mode='fixed' and classifier='dda'")
+def measure_frame(coords_A, radii_A, masses_Da, *, method="connectivity", config=None,
+                  cutoff=None, directions=None, return_labels=False):
+    cfg = config or VolInteriorConfig(backend="cuda")
+    if method not in DEFINITIONS or cfg.backend not in {"cpu", "cuda"}:
+        raise ValueError("choose connectivity/fixed/fuzzy and an explicit cpu/cuda backend")
+    if method == "fuzzy":
+        minimum_blocked(cutoff, cfg.nrays)
     coords = np.asarray(coords_A, dtype=np.float32)
     radii = np.asarray(radii_A, dtype=np.float32)
-    if radii.ndim != 1 or radii.shape[0] != coords.shape[0] or np.any(radii <= 0):
-        raise ValueError("radii_A must have one positive value per coordinate")
-
-    if backend != "cuda":
-        result = measure_volinterior(
-            coords,
-            radii,
-            box_A=box_A,
-            config=cfg,
-            return_density=False,
-            return_probability=False,
-        )
-        return VolInteriorCountsResult(
-            grid=result.grid,
-            interior_voxels=result.interior_voxels,
-            surface_voxels=int(np.count_nonzero(result.surface)),
-            exterior_voxels=result.exterior_voxels,
-            backend=result.backend,
-            config=result.config,
-        )
-
-    import cupy as cp
-
-    grid = make_grid(
-        coords,
-        cfg,
-        box_A=box_A,
-        max_radius_A=float(np.max(radii)),
-    )
-    density_device = quicksurf_density_cuda(
-        coords,
-        radii,
-        grid,
-        cfg.radius_scale_A,
-        cfg.gausslim,
-        kernel_mode=cfg.density_kernel,
-        accel_grid_spacing_A=cfg.accel_grid_spacing_A,
-    )
-    surface_device = surface_mask(density_device, cfg.isovalue)
-    directions = make_directions(
-        cfg.nrays,
-        cfg.ray_scheme,
-        cfg.ray_seed,
-        cfg.ray_candidates,
-    )
-    interior_voxels = raycast_interior_count_cuda(surface_device, directions)
-    surface_voxels = int(cp.count_nonzero(surface_device).get())
-    exterior_voxels = grid.n_voxels - interior_voxels - surface_voxels
-    return VolInteriorCountsResult(
-        grid=grid,
-        interior_voxels=interior_voxels,
-        surface_voxels=surface_voxels,
-        exterior_voxels=exterior_voxels,
-        backend=backend,
-        config=cfg.as_dict(),
-    )
+    masses = np.asarray(masses_Da, dtype=np.float64)
+    if coords.ndim != 2 or coords.shape[1] != 3 or not len(coords) or not np.isfinite(coords).all():
+        raise ValueError("finite coordinates with shape (n_atoms, 3) are required")
+    for name, array in (("radii", radii), ("masses", masses)):
+        if array.shape != (len(coords),) or not np.isfinite(array).all() or not (array > 0).all():
+            raise ValueError(f"{name} must have one finite positive value per atom")
+    started = time.perf_counter()
+    grid = make_grid(coords, cfg, max_radius_A=float(radii.max()))
+    center = np.average(coords, axis=0, weights=masses)
+    seed = tuple(np.rint((center - grid.origin_A) / grid.spacing_A).astype(int))
+    if cfg.backend == "cuda":
+        import cupy as cp
+        density = quicksurf_density_cuda(coords, radii, grid, cfg.radius_scale_A, cfg.gausslim,
+                                         kernel_mode="cell_list")
+        material = density >= np.float32(cfg.isovalue)
+        del density
+        cp.cuda.get_current_stream().synchronize()
+    else:
+        density = quicksurf_density_cpu(coords, radii, grid, cfg.radius_scale_A, cfg.gausslim)
+        material = density >= np.float32(cfg.isovalue)
+        del density
+    density_done = time.perf_counter()
+    raw_material = int(material.sum().item())
+    if method == "connectivity":
+        counts, labels = connectivity_partition(material, seed, backend=cfg.backend, return_labels=return_labels)
+    else:
+        if directions is None:
+            directions = make_directions(cfg.nrays, cfg.ray_scheme, cfg.ray_seed, cfg.ray_candidates)
+        if len(directions) != cfg.nrays:
+            raise ValueError("ray count differs from config.nrays")
+        counts, labels = dda_partition(material, directions, mode=method, cutoff=cutoff,
+                                       backend=cfg.backend, return_labels=return_labels)
+    if cfg.backend == "cuda":
+        cp.cuda.get_current_stream().synchronize()
+    finished = time.perf_counter()
+    defaults = {"closure_pass": None, "center_in_material": None, "center_connected_to_boundary": None,
+                "central_lumen_voxels": None, "other_interior_voxels": None,
+                "interior_components": None, "failure_reason": ""}
+    counts = {**defaults, **counts}
+    counts.update(method=method, definition=DEFINITIONS[method], total_voxels=grid.n_voxels,
+                  density_voxels=raw_material, cell_volume_A3=grid.voxel_volume_A3,
+                  density_isovalue=cfg.isovalue, resolution=cfg.resolution, grid_spacing_A=cfg.spacing_A,
+                  fuzzy_cutoff=cutoff if method == "fuzzy" else None,
+                  minimum_blocked_rays=minimum_blocked(cutoff, cfg.nrays) if method == "fuzzy" else None,
+                  nrays=cfg.nrays if method != "connectivity" else None,
+                  grid_x=grid.shape[0], grid_y=grid.shape[1], grid_z=grid.shape[2],
+                  origin_x_A=float(grid.origin_A[0]), origin_y_A=float(grid.origin_A[1]), origin_z_A=float(grid.origin_A[2]),
+                  capsid_com_x_A=float(center[0]), capsid_com_y_A=float(center[1]), capsid_com_z_A=float(center[2]),
+                  density_seconds=density_done-started, classification_seconds=finished-density_done,
+                  frame_seconds=finished-started)
+    counts["lumen_voxels"] = counts["interior_voxels"]
+    counts["shell_voxels"] = counts["selection_voxels"]
+    counts["outer_voxels"] = counts["lumen_voxels"] + counts["shell_voxels"]
+    if counts["outer_voxels"] + counts["exterior_voxels"] != grid.n_voxels:
+        raise RuntimeError("voxel partition does not conserve the grid")
+    for compartment in ("lumen", "shell", "outer"):
+        counts[compartment + "_volume_nm3"] = counts[compartment + "_voxels"] * grid.voxel_volume_A3 / 1000
+    return FrameResult(counts, grid, labels)
